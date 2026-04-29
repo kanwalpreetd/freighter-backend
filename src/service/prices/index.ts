@@ -413,6 +413,17 @@ export class PriceClient {
    */
   private async addBatchToCache(tokenBatch: TokenKey[]): Promise<void> {
     const prices = await this.calculateBatchPrices(tokenBatch);
+
+    // Defense-in-depth: if a token in the batch failed price calculation and
+    // its TS key has no samples, treat it as an orphan (e.g. created before
+    // the addNewTokenToCache reorder fix) and evict it so the worker stops
+    // retrying it indefinitely.
+    const succeeded = new Set(prices.map((p) => p.token));
+    const failed = tokenBatch.filter((token) => !succeeded.has(token));
+    if (failed.length > 0) {
+      await this.evictOrphans(failed);
+    }
+
     if (prices.length === 0) {
       this.logger.warn("No prices calculated for batch");
       return;
@@ -426,6 +437,40 @@ export class PriceClient {
       }),
     );
     await this.redisClient!.ts.mAdd(mAddEntries);
+  }
+
+  private async evictOrphans(tokens: TokenKey[]): Promise<void> {
+    if (!this.redisClient) {
+      return;
+    }
+    for (const token of tokens) {
+      const tsKey = this.getTimeSeriesKey(token);
+      let hasSamples = false;
+      try {
+        const latest = await this.redisClient.ts.get(tsKey);
+        hasSamples = !!latest;
+      } catch (e) {
+        // ts.get on a missing key throws — treat as no samples and evict.
+        // Mirrors the pattern used by getPrice (any error → cache miss path).
+        // Transient-error defense belongs at the client layer, not here.
+        hasSamples = false;
+      }
+
+      if (hasSamples) {
+        continue;
+      }
+
+      try {
+        await this.redisClient.zRem(
+          PriceClient.TOKEN_COUNTER_SORTED_SET_KEY,
+          tsKey,
+        );
+        await this.redisClient.del(tsKey);
+        this.logger.warn(`Evicted orphan token ${token} from price cache`);
+      } catch (e) {
+        this.logger.error(ensureError(e, `evicting orphan ${token}`));
+      }
+    }
   }
 
   /**
@@ -582,36 +627,59 @@ export class PriceClient {
   private addNewTokenToCache = async (
     token: TokenKey,
   ): Promise<TokenPriceData | null> => {
+    if (!this.redisClient) {
+      throw new Error("Redis client not initialized");
+    }
+
+    // Normalize first so "native" is handled the same as "XLM" downstream —
+    // calculatePriceInUSD only special-cases "XLM", and the TS key uses "XLM".
+    const tsKey = this.getTimeSeriesKey(token);
+
+    // Calculate the price first so a failed calculation never persists an
+    // orphan TS key or token_counter entry that the worker would retry forever.
+    let result: PriceCalculationResult;
     try {
-      if (!this.redisClient) {
-        throw new Error("Redis client not initialized");
-      }
-
-      let tsKey: string;
-      try {
-        tsKey = this.getTimeSeriesKey(token);
-        await this.createTimeSeries(tsKey);
-      } catch (e) {
-        throw new Error(`creating time series for ${token}`);
-      }
-
-      const { timestamp, price } = await this.calculatePriceInUSD(token);
-
-      try {
-        await this.redisClient.ts.add(tsKey, timestamp, price.toNumber());
-      } catch (e) {
-        throw new Error(`adding price to time series for ${token}`);
-      }
-
-      return {
-        currentPrice: price,
-        percentagePriceChange24h: null,
-      } as TokenPriceData;
+      result = await this.calculatePriceInUSD(tsKey);
     } catch (e) {
-      const error = ensureError(e, `adding new token to cache for ${token}`);
-      this.logger.error(error);
+      this.logger.error(ensureError(e, `calculating price for ${token}`));
       return null;
     }
+
+    try {
+      await this.createTimeSeries(tsKey);
+      await this.redisClient.ts.add(
+        tsKey,
+        result.timestamp,
+        result.price.toNumber(),
+      );
+    } catch (e) {
+      this.logger.error(
+        ensureError(e, `adding new token to cache for ${token}`),
+      );
+      // Compensate for partial state: createTimeSeries writes both the TS
+      // key and the token_counter entry, so a failed ts.add would otherwise
+      // leave an orphan until the next evictOrphans pass on the worker tick.
+      try {
+        await this.redisClient.zRem(
+          PriceClient.TOKEN_COUNTER_SORTED_SET_KEY,
+          tsKey,
+        );
+        await this.redisClient.del(tsKey);
+      } catch (cleanupErr) {
+        this.logger.warn(
+          ensureError(
+            cleanupErr,
+            `cleaning up partial cache state for ${token}`,
+          ),
+        );
+      }
+      return null;
+    }
+
+    return {
+      currentPrice: result.price,
+      percentagePriceChange24h: null,
+    };
   };
 
   /**

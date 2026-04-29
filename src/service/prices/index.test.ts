@@ -2,7 +2,7 @@ import { PriceClient } from "./index";
 import { testLogger } from "../../helper/test-helper";
 import { TokenPriceData } from "./types";
 import BigNumber from "bignumber.js";
-import { PriceCalculationError } from "./errors";
+import { PathsNotFoundError, PriceCalculationError } from "./errors";
 describe("Token Price Client", () => {
   let priceClient: PriceClient;
   const mockRedisClient: any = {
@@ -16,6 +16,8 @@ describe("Token Price Client", () => {
     },
     zIncrBy: jest.fn(),
     zRange: jest.fn(),
+    zRem: jest.fn(),
+    del: jest.fn(),
     set: jest.fn(),
     multi: jest.fn(),
     get: jest.fn(),
@@ -267,9 +269,7 @@ describe("Token Price Client", () => {
       expect(result).toBeNull();
       expect(testLogger.error).toHaveBeenCalledWith(
         expect.objectContaining({
-          message: expect.stringContaining(
-            `adding new token to cache for ${token}`,
-          ),
+          message: expect.stringContaining(`calculating price for ${token}`),
         }),
       );
 
@@ -282,6 +282,111 @@ describe("Token Price Client", () => {
           `Token in cache but no latest price found for ${token}`,
         ),
       );
+    });
+
+    it("should NOT persist Redis state when price calculation fails for new token", async () => {
+      // Issue #306: addNewTokenToCache must not create a TS key or increment
+      // the token_counter sorted set when calculatePriceInUSD rejects.
+      mockRedisClient.ts.get.mockRejectedValue(new Error("Key does not exist"));
+
+      const token =
+        "FAKE:GBVK6IBOJOX44RFGUZHVH6P3RP4QYLEPZHMTCG2RMQ6GUKQTWAFXKW3J";
+      jest
+        .spyOn(priceClient as any, "calculatePriceInUSD")
+        .mockRejectedValue(new PathsNotFoundError(token));
+
+      const result = await priceClient.getPrice(token);
+
+      expect(result).toBeNull();
+      // No orphan TS key
+      expect(mockRedisClient.ts.create).not.toHaveBeenCalled();
+      expect(mockRedisClient.ts.add).not.toHaveBeenCalled();
+      // No orphan sorted-set entry
+      expect(mockRedisClient.zIncrBy).not.toHaveBeenCalled();
+    });
+
+    it("should clean up partial state when ts.add fails after createTimeSeries", async () => {
+      // If ts.add throws after createTimeSeries has already run ts.create +
+      // zIncrBy, addNewTokenToCache must compensate so we don't leave an
+      // orphan TS key + token_counter entry for the next evictOrphans tick.
+      mockRedisClient.ts.get.mockRejectedValue(new Error("Key does not exist"));
+
+      const token =
+        "FAKE:GBVK6IBOJOX44RFGUZHVH6P3RP4QYLEPZHMTCG2RMQ6GUKQTWAFXKW3J";
+      jest.spyOn(priceClient as any, "calculatePriceInUSD").mockResolvedValue({
+        timestamp: 222,
+        price: new BigNumber(0.12),
+      });
+
+      mockRedisClient.ts.add.mockRejectedValueOnce(new Error("redis blip"));
+
+      const result = await priceClient.getPrice(token);
+
+      expect(result).toBeNull();
+      // createTimeSeries did run, so both writes happened…
+      expect(mockRedisClient.ts.create).toHaveBeenCalledWith(
+        token,
+        expect.any(Object),
+      );
+      expect(mockRedisClient.zIncrBy).toHaveBeenCalledWith(
+        "token_counter",
+        1,
+        token,
+      );
+      // …and the catch arm must have undone them.
+      expect(mockRedisClient.zRem).toHaveBeenCalledWith("token_counter", token);
+      expect(mockRedisClient.del).toHaveBeenCalledWith(token);
+    });
+
+    it("should not throw if compensating cleanup itself fails", async () => {
+      // Cleanup is best-effort: a failure in zRem/del must not mask the
+      // original ts.add error or surface as an unhandled rejection.
+      mockRedisClient.ts.get.mockRejectedValue(new Error("Key does not exist"));
+
+      const token =
+        "FAKE:GBVK6IBOJOX44RFGUZHVH6P3RP4QYLEPZHMTCG2RMQ6GUKQTWAFXKW3J";
+      jest.spyOn(priceClient as any, "calculatePriceInUSD").mockResolvedValue({
+        timestamp: 222,
+        price: new BigNumber(0.12),
+      });
+
+      mockRedisClient.ts.add.mockRejectedValueOnce(new Error("redis blip"));
+      mockRedisClient.zRem.mockRejectedValueOnce(new Error("still flaky"));
+
+      const result = await priceClient.getPrice(token);
+
+      expect(result).toBeNull();
+      expect(testLogger.warn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          message: expect.stringContaining(
+            `cleaning up partial cache state for ${token}`,
+          ),
+        }),
+      );
+    });
+
+    it("should normalize 'native' to XLM when populating a cache miss", async () => {
+      // calculatePriceInUSD only special-cases "XLM"; passing the raw "native"
+      // would throw InvalidTokenFormatError. addNewTokenToCache must normalize
+      // first so a cache miss for "native" populates correctly.
+      mockRedisClient.ts.get.mockRejectedValue(new Error("Key does not exist"));
+
+      const calcSpy = jest
+        .spyOn(priceClient as any, "calculatePriceInUSD")
+        .mockResolvedValue({
+          timestamp: 222,
+          price: new BigNumber(0.12),
+        });
+
+      const result = await priceClient.getPrice("native");
+
+      expect(calcSpy).toHaveBeenCalledWith("XLM");
+      expect(mockRedisClient.ts.create).toHaveBeenCalledWith(
+        "XLM",
+        expect.any(Object),
+      );
+      expect(mockRedisClient.ts.add).toHaveBeenCalledWith("XLM", 222, 0.12);
+      expect(result?.currentPrice.toNumber()).toBe(0.12);
     });
 
     it("handles errors", async () => {
@@ -479,6 +584,77 @@ describe("Token Price Client", () => {
       expect(testLogger.warn).toHaveBeenCalledWith(
         "No prices calculated for batch",
       );
+    });
+
+    it("addBatchToCache should evict orphan tokens whose TS has no samples and price calc failed", async () => {
+      // Issue #306 defense-in-depth: if a token in the batch fails price
+      // calculation AND its TS has zero samples, treat it as an orphan and
+      // remove it from token_counter + delete the empty TS key.
+      jest
+        .spyOn(priceClient as any, "calculatePriceInUSD")
+        .mockImplementation((token: any) => {
+          if (token === "GOOD:TOKEN") {
+            return Promise.resolve({
+              timestamp: 111,
+              price: new BigNumber(100),
+            });
+          }
+          return Promise.reject(new PathsNotFoundError(token as string));
+        });
+
+      // Orphan TS has no samples — ts.get returns null
+      mockRedisClient.ts.get.mockResolvedValue(null);
+
+      await priceClient["addBatchToCache"](["GOOD:TOKEN", "ORPHAN:TOKEN"]);
+
+      expect(mockRedisClient.zRem).toHaveBeenCalledWith(
+        "token_counter",
+        "ORPHAN:TOKEN",
+      );
+      expect(mockRedisClient.del).toHaveBeenCalledWith("ORPHAN:TOKEN");
+      // Good token's price still added
+      expect(mockRedisClient.ts.mAdd).toHaveBeenCalledWith(
+        expect.arrayContaining([
+          expect.objectContaining({
+            key: "GOOD:TOKEN",
+            timestamp: 111,
+            value: 100,
+          }),
+        ]),
+      );
+    });
+
+    it("addBatchToCache should NOT evict tokens with existing samples on transient calc failure", async () => {
+      jest
+        .spyOn(priceClient as any, "calculatePriceInUSD")
+        .mockRejectedValue(new Error("transient horizon error"));
+
+      // TS has at least one sample — token is healthy, just transient failure
+      mockRedisClient.ts.get.mockResolvedValue({
+        timestamp: 1234,
+        value: 99,
+      });
+
+      await priceClient["addBatchToCache"](["HEALTHY:TOKEN"]);
+
+      expect(mockRedisClient.zRem).not.toHaveBeenCalled();
+      expect(mockRedisClient.del).not.toHaveBeenCalled();
+    });
+
+    it("addBatchToCache should evict when ts.get throws for missing key", async () => {
+      jest
+        .spyOn(priceClient as any, "calculatePriceInUSD")
+        .mockRejectedValue(new PathsNotFoundError("ORPHAN:TOKEN"));
+
+      mockRedisClient.ts.get.mockRejectedValue(new Error("key does not exist"));
+
+      await priceClient["addBatchToCache"](["ORPHAN:TOKEN"]);
+
+      expect(mockRedisClient.zRem).toHaveBeenCalledWith(
+        "token_counter",
+        "ORPHAN:TOKEN",
+      );
+      expect(mockRedisClient.del).toHaveBeenCalledWith("ORPHAN:TOKEN");
     });
 
     it("getTimeSeriesKey should handle native asset correctly", async () => {
