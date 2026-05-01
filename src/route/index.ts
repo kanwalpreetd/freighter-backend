@@ -46,7 +46,11 @@ import { getSdk } from "../helper/stellar";
 import { getUseMercury } from "../helper/mercury";
 import { getHttpRequestDurationLabels } from "../helper/metrics";
 import { mode } from "../helper/env";
-import { fetchOnrampSessionToken, CoinbaseConfig } from "../helper/onramp";
+import {
+  fetchOnrampSessionToken,
+  isLikelyInternalIp,
+  CoinbaseConfig,
+} from "../helper/onramp";
 import Blockaid from "@blockaid/client";
 import { PriceClient } from "../service/prices";
 import { TokenPriceData } from "../service/prices/types";
@@ -1475,6 +1479,24 @@ export async function initApiServer(
           reply,
         ) => {
           const { address } = request.body;
+          // Forwarded to Coinbase to bind the resulting Onramp session to the
+          // requesting client. Relies on FREIGHTER_TRUST_PROXY_RANGE matching
+          // the actual upstream proxy CIDR. If request.ip looks like an
+          // intra-cluster address, the trust chain is misconfigured — drop
+          // clientIp (Coinbase rejects private addresses) and surface a warn.
+          const rawIp = request.ip;
+          const clientIp = isLikelyInternalIp(rawIp) ? undefined : rawIp;
+          if (!clientIp) {
+            logger.warn(
+              {
+                rawIp,
+                xff: request.headers["x-forwarded-for"],
+                xRealIp: request.headers["x-real-ip"],
+                socketRemote: request.socket.remoteAddress,
+              },
+              "onramp.token: request.ip resolved to private/internal address; FREIGHTER_TRUST_PROXY_RANGE likely misconfigured. Skipping clientIp.",
+            );
+          }
           if (
             !coinbaseConfig.coinbaseApiKey ||
             !coinbaseConfig.coinbaseApiSecret
@@ -1485,6 +1507,7 @@ export async function initApiServer(
           try {
             const { data, error } = await fetchOnrampSessionToken({
               address,
+              clientIp,
               coinbaseConfig,
             });
 

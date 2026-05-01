@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import * as crypto from "crypto";
+import proxyaddr from "proxy-addr";
 
 const requestMethod = "POST";
 const requestHost = "api.developer.coinbase.com";
@@ -11,6 +12,22 @@ export interface CoinbaseConfig {
   coinbaseApiKey: string;
   coinbaseApiSecret: string;
 }
+
+// Loopback, link-local, and unique-local (RFC1918 + IPv6 ULA) addresses.
+// Used to avoid forwarding intra-cluster IPs to Coinbase when the trustProxy
+// chain is misconfigured — Coinbase rejects private addresses, so dropping
+// clientIp keeps the endpoint functional while we surface the misconfiguration
+// via a warning log at the call site.
+const internalAddr = proxyaddr.compile([
+  "loopback",
+  "linklocal",
+  "uniquelocal",
+]);
+
+export const isLikelyInternalIp = (ip: string): boolean => {
+  if (!ip) return true;
+  return internalAddr(ip, 0);
+};
 
 export const generateJWT = ({
   coinbaseConfig,
@@ -48,9 +65,11 @@ export const generateJWT = ({
 
 export const fetchOnrampSessionToken = async ({
   address,
+  clientIp,
   coinbaseConfig,
 }: {
   address: string;
+  clientIp?: string;
   coinbaseConfig: {
     coinbaseApiKey: string;
     coinbaseApiSecret: string;
@@ -65,6 +84,7 @@ export const fetchOnrampSessionToken = async ({
       },
       body: JSON.stringify({
         addresses: [{ address, blockchains: ["stellar"], assets: ["XLM"] }],
+        ...(clientIp ? { clientIp } : {}),
       }),
     };
     const res = await fetch(`https://${requestHost}${requestPath}`, options);
@@ -73,7 +93,16 @@ export const fetchOnrampSessionToken = async ({
       if (res.status >= 500 && res.status < 600) {
         throw new Error("Server error when requesting token");
       }
-      return { data: { token: "", error: "Error fetching token request" } };
+      let detail = "";
+      try {
+        detail = await res.text();
+      } catch {
+        // body unreadable
+      }
+      return {
+        data: { token: "" },
+        error: `Coinbase ${res.status}${detail ? `: ${detail}` : ""}`,
+      };
     }
 
     const resJson = await res.json();

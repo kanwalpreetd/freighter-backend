@@ -1110,14 +1110,16 @@ describe("API routes", () => {
     });
 
     it("can fetch an onramp token", async () => {
-      jest.spyOn(OnrampHelpers, "fetchOnrampSessionToken").mockReturnValueOnce(
-        Promise.resolve({
-          data: {
-            token: "token",
-          },
-          error: null,
-        }),
-      );
+      const fetchSpy = jest
+        .spyOn(OnrampHelpers, "fetchOnrampSessionToken")
+        .mockReturnValueOnce(
+          Promise.resolve({
+            data: {
+              token: "token",
+            },
+            error: null,
+          }),
+        );
 
       const server = await getDevServer();
       const url = new URL(
@@ -1139,6 +1141,15 @@ describe("API routes", () => {
 
       expect(response.status).toEqual(200);
       expect(resJson.data.token).toEqual("token");
+      // Local test traffic comes from a loopback address, which is
+      // classified as internal and dropped (Coinbase rejects private IPs).
+      // Real client traffic in prod resolves to a public IP and is forwarded.
+      expect(fetchSpy).toHaveBeenCalledWith(
+        expect.objectContaining({
+          address: "GFOO",
+          clientIp: undefined,
+        }),
+      );
       await server.close();
     });
     it("does not fetch a token without Coinbase config", async () => {
